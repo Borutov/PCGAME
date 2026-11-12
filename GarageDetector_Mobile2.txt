@@ -1,0 +1,967 @@
+-- ================================================================
+-- GARAGE DETECTOR v2.0  —  Mobile Edition
+-- Para Delta Executor (Android/iOS) | Roblox Portal Sandbox
+-- ================================================================
+-- Adaptações mobile:
+--   • Layout vertical em cartões (sem tabela horizontal)
+--   • Fonte e botões grandes o suficiente para dedos
+--   • Drag por toque (Touch) com delta acumulado correto
+--   • Botão flutuante de reabrir quando minimizado
+--   • Largura relativa à viewport (escala %) em vez de px fixos
+--   • ScrollingFrame com ScrollBarThickness=0 (dedos já rolam)
+--   • Sem MouseButton1Click — usa Activated (funciona em PC e mobile)
+--   • GuiService.TouchControlsEnabled não alterado
+--   • IgnoreGuiInset = true para evitar deslocamento pelo inset iOS/Android
+-- ================================================================
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local GuiService       = game:GetService("GuiService")
+
+local Camera           = workspace.CurrentCamera
+local LocalPlayer      = Players.LocalPlayer
+local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ================================================================
+-- DETECÇÃO DE PLATAFORMA
+-- ================================================================
+local isMobile = UserInputService.TouchEnabled and
+                 not UserInputService.KeyboardEnabled
+
+-- ================================================================
+-- CONSTANTES
+-- ================================================================
+local UPDATE_INTERVAL  = 0.5
+local GUI_NAME         = "GarageDetectorHUD"
+local FAB_NAME         = "GarageDetectorFAB"   -- botão flutuante
+
+-- Dimensões adaptativas
+local W_FULL           = isMobile and UDim2.new(0.95, 0, 0, 0)  or UDim2.new(0, 460, 0, 0)
+local W_FULL_REF       = isMobile and 0.95  or nil   -- para recálculo
+local CARD_H           = isMobile and 76   or 56     -- altura do cartão por jogador
+local HDR_H            = isMobile and 44   or 36
+local STATS_H          = isMobile and 38   or 32
+local COL_H            = isMobile and 0    or 20     -- cabeçalho de coluna (oculto no mobile)
+local FONT_TITLE       = isMobile and 15   or 14
+local FONT_STAT        = isMobile and 12   or 11
+local FONT_CARD        = isMobile and 12   or 11
+local FONT_CARD_VAL    = isMobile and 13   or 12
+local BTN_W            = isMobile and 36   or 24
+local BTN_H            = isMobile and 30   or 18
+local SCROLL_BAR_W     = isMobile and 0    or 4
+local MAX_H            = isMobile and 500  or 420
+local PADDING          = isMobile and 6    or 4
+local FAB_SIZE         = isMobile and 48   or 32
+
+-- ================================================================
+-- PALETA
+-- ================================================================
+local C = {
+    BG      = Color3.fromRGB(13,  13,  20 ),
+    HDR     = Color3.fromRGB(22,  22,  34 ),
+    CARD    = Color3.fromRGB(20,  20,  32 ),
+    BORDER  = Color3.fromRGB(48,  48,  70 ),
+    TITLE   = Color3.fromRGB(180, 140, 255),
+    WHITE   = Color3.fromRGB(228, 228, 228),
+    GRAY    = Color3.fromRGB(120, 120, 145),
+    GREEN   = Color3.fromRGB( 72, 210, 110),
+    RED     = Color3.fromRGB(215,  72,  72),
+    YELLOW  = Color3.fromRGB(215, 195,  65),
+    PURPLE  = Color3.fromRGB(175,  95, 255),
+    CYAN    = Color3.fromRGB( 72, 195, 215),
+    CLOSE   = Color3.fromRGB(195,  60,  60),
+    MINI    = Color3.fromRGB(210, 170,  50),
+    FAB     = Color3.fromRGB( 90,  60, 160),
+}
+
+-- ================================================================
+-- ESTADO
+-- ================================================================
+local playerData  = {}
+local cardFrames  = {}
+local connections = {}
+local minimized   = false
+local screenGui, mainFrame, listFrame
+local lblTotal, lblInGarage, lblOutside, lblUnknown
+local fabGui
+
+-- ================================================================
+-- UTILITÁRIOS
+-- ================================================================
+local function fmt(n, d)
+    return string.format("%." .. (d or 1) .. "f", n)
+end
+
+local function fmtPos(pos)
+    if not pos then return "N/A" end
+    return fmt(pos.X,0).." "..fmt(pos.Y,0).." "..fmt(pos.Z,0)
+end
+
+local function timeNow()
+    return string.format("%02d:%02d",
+        math.floor(tick()/60)%60, math.floor(tick())%60)
+end
+
+local function safeGet(obj, prop)
+    local ok, v = pcall(function() return obj[prop] end)
+    return ok and v or nil
+end
+
+-- Clamp para manter frame dentro da tela
+local function clampFrame(frame)
+    local vp = Camera.ViewportSize
+    local abs = frame.AbsoluteSize
+    local px  = frame.Position.X.Offset
+    local py  = frame.Position.Y.Offset
+    px = math.clamp(px, 0, math.max(0, vp.X - abs.X))
+    py = math.clamp(py, 0, math.max(0, vp.Y - abs.Y))
+    frame.Position = UDim2.new(0, px, 0, py)
+end
+
+-- ================================================================
+-- DETECÇÃO DE GARAGENS
+-- ================================================================
+local garageCache   = {}
+local garageCacheTS = 0
+local GARAGE_TTL    = 5
+
+local GARAGE_PAT = {
+    "garage","garagem","player.*garage","garage.*player",
+    "slot","bay","hangar","parking",
+}
+
+local function nameIsGarage(name)
+    local low = name:lower()
+    for _, p in ipairs(GARAGE_PAT) do
+        if low:match(p) then return true end
+    end
+    return false
+end
+
+local function extractOwner(obj)
+    for _, attr in ipairs({"Owner","PlayerName","OwnerName"}) do
+        local ok, v = pcall(function() return obj:GetAttribute(attr) end)
+        if ok and type(v)=="string" and v~="" then return v end
+    end
+    local ok2, children = pcall(function() return obj:GetChildren() end)
+    if ok2 then
+        for _, child in ipairs(children) do
+            local cn = child.ClassName
+            if cn=="StringValue" or cn=="ObjectValue" then
+                local low = child.Name:lower()
+                if low=="owner" or low=="playername" or low=="player" then
+                    local ok3, v = pcall(function()
+                        if cn=="StringValue" then return child.Value
+                        elseif cn=="ObjectValue" and child.Value then
+                            return child.Value.Name
+                        end
+                    end)
+                    if ok3 and v and v~="" then return v end
+                end
+            end
+        end
+    end
+    local part = obj.Name:match("[Gg]arage[_%-]?(.+)") or
+                 obj.Name:match("[Ss]lot[_%-]?(.+)")    or
+                 obj.Name:match("[Pp]layer[_%-]?(.+)")
+    if part and part~="" then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Name==part or p.DisplayName==part then return p.Name end
+        end
+        return part
+    end
+    return nil
+end
+
+local function getModelBounds(obj)
+    local ok, cf, sz = pcall(function() return obj:GetBoundingBox() end)
+    if ok and cf and sz then return cf, sz end
+    local pp = safeGet(obj,"PrimaryPart")
+    if pp then
+        local pos = safeGet(pp,"Position")
+        if pos then return CFrame.new(pos), Vector3.new(20,10,20) end
+    end
+    return nil, nil
+end
+
+local function refreshGarageCache()
+    garageCache   = {}
+    garageCacheTS = tick()
+    local function scan(folder, depth)
+        if depth > 3 then return end
+        local ok, children = pcall(function() return folder:GetChildren() end)
+        if not ok then return end
+        for _, obj in ipairs(children) do
+            local cn = obj.ClassName
+            if cn=="Model" or cn=="Folder" or cn=="Part" or
+               cn=="UnionOperation" or cn=="MeshPart" then
+                local n = safeGet(obj,"Name") or ""
+                if nameIsGarage(n) then
+                    local cf, sz = getModelBounds(obj)
+                    if cf then
+                        table.insert(garageCache,{
+                            model=obj, owner=extractOwner(obj),
+                            cframe=cf, size=sz or Vector3.new(20,10,20), name=n
+                        })
+                    end
+                end
+                scan(obj, depth+1)
+            end
+        end
+    end
+    scan(workspace, 0)
+end
+
+local function garageAtPos(pos)
+    if tick()-garageCacheTS > GARAGE_TTL then refreshGarageCache() end
+    for _, g in ipairs(garageCache) do
+        local ok, lp = pcall(function() return g.cframe:PointToObjectSpace(pos) end)
+        if ok and lp then
+            local hs = g.size/2
+            if math.abs(lp.X)<=hs.X+1 and lp.Y>=-2 and
+               lp.Y<=hs.Y+2 and math.abs(lp.Z)<=hs.Z+1 then
+                return g
+            end
+        end
+    end
+    return nil
+end
+
+-- ================================================================
+-- DETECÇÃO DE DIMENSÕES
+-- ================================================================
+local dimCache   = {}
+local dimCacheTS = 0
+local DIM_TTL    = 5
+
+local DIM_PAT = {
+    "dimension","dim","world","realm","zone","region",
+    "universe","plane","area","sector",
+}
+
+local function nameIsDim(name)
+    local low = name:lower()
+    for _, p in ipairs(DIM_PAT) do
+        if low:match(p) then return true end
+    end
+    return false
+end
+
+local function refreshDimCache()
+    dimCache   = {}
+    dimCacheTS = tick()
+    local function scan(folder, depth)
+        if depth>3 then return end
+        local ok, children = pcall(function() return folder:GetChildren() end)
+        if not ok then return end
+        for _, obj in ipairs(children) do
+            local n = safeGet(obj,"Name") or ""
+            if nameIsDim(n) then
+                local cf, sz = getModelBounds(obj)
+                if cf then
+                    table.insert(dimCache,{
+                        name=n, cframe=cf,
+                        size=sz or Vector3.new(500,200,500)
+                    })
+                end
+            end
+            local cn = obj.ClassName
+            if cn=="Model" or cn=="Folder" then scan(obj,depth+1) end
+        end
+    end
+    scan(workspace,0)
+end
+
+local function dimAtPos(pos)
+    if tick()-dimCacheTS > DIM_TTL then refreshDimCache() end
+    for _, d in ipairs(dimCache) do
+        local ok, lp = pcall(function() return d.cframe:PointToObjectSpace(pos) end)
+        if ok and lp then
+            local hs = d.size/2
+            if math.abs(lp.X)<=hs.X and lp.Y>=-hs.Y and
+               lp.Y<=hs.Y and math.abs(lp.Z)<=hs.Z then
+                return d.name
+            end
+        end
+    end
+    if pos.Y>5000  then return "Dim High" end
+    if pos.Y<-5000 then return "Dim Low"  end
+    return "UNKNOWN"
+end
+
+-- ================================================================
+-- VISIBILIDADE
+-- ================================================================
+local function checkVis(character)
+    if not character then return "NO CHAR" end
+    local hrp = safeGet(character,"HumanoidRootPart")
+    if not hrp then return "NO HRP" end
+    if not safeGet(character,"Humanoid") then return "NO HUM" end
+    local ok, pos = pcall(function() return hrp.Position end)
+    if not ok or not pos then return "NO POS" end
+    local ok2, _, onScreen = pcall(function()
+        return Camera:WorldToScreenPoint(pos)
+    end)
+    if ok2 and onScreen then return "VISIBLE" end
+    return "OFFSCREEN"
+end
+
+-- ================================================================
+-- DADOS DO JOGADOR
+-- ================================================================
+local function initData(player)
+    playerData[player.UserId] = {
+        player       = player,
+        name         = player.Name,
+        garageStatus = "LOADING",
+        garageOwner  = "UNKNOWN",
+        dimension    = "UNKNOWN",
+        position     = nil,
+        visibility   = "UNKNOWN",
+        lastUpdate   = "--:--",
+    }
+end
+
+local function updateData(player)
+    local uid  = player.UserId
+    local data = playerData[uid]
+    if not data then return end
+
+    local char = safeGet(player,"Character")
+    if not char then
+        data.garageStatus="LOADING"; data.dimension="UNKNOWN"
+        data.position=nil; data.visibility="NO CHAR"
+        data.lastUpdate=timeNow(); return
+    end
+    local hrp = safeGet(char,"HumanoidRootPart")
+    if not hrp then
+        data.garageStatus="LOADING"; data.dimension="UNKNOWN"
+        data.position=nil; data.visibility="NO HRP"
+        data.lastUpdate=timeNow(); return
+    end
+    local ok, pos = pcall(function() return hrp.Position end)
+    if not ok or not pos then
+        data.garageStatus="LOADING"; data.visibility="NO POS"
+        data.lastUpdate=timeNow(); return
+    end
+
+    data.position   = pos
+    data.visibility = checkVis(char)
+    data.dimension  = dimAtPos(pos)
+
+    local garage = garageAtPos(pos)
+    if garage then
+        local ow = garage.owner
+        data.garageOwner = ow or "UNKNOWN"
+        if ow then
+            data.garageStatus = (ow==player.Name or ow==player.DisplayName)
+                and "IN GARAGE" or "OUTSIDE"
+        else
+            data.garageStatus = "UNKNOWN"
+        end
+    else
+        data.garageStatus = (#garageCache==0) and "UNKNOWN" or "OUTSIDE"
+    end
+    data.lastUpdate = timeNow()
+end
+
+-- ================================================================
+-- CORES POR ESTADO
+-- ================================================================
+local function colorGarage(s)
+    if s=="IN GARAGE" then return C.GREEN
+    elseif s=="OUTSIDE" then return C.RED
+    elseif s=="LOADING" then return C.GRAY
+    else return C.YELLOW end
+end
+local function colorDim(d)
+    return d=="UNKNOWN" and C.GRAY or C.PURPLE
+end
+local function colorVis(v)
+    if v=="VISIBLE" then return C.GREEN
+    elseif v=="OFFSCREEN" then return C.YELLOW
+    else return C.GRAY end
+end
+
+-- ================================================================
+-- INTERFACE HUD
+-- ================================================================
+local function destroyOld()
+    local g = PlayerGui:FindFirstChild(GUI_NAME)
+    if g then g:Destroy() end
+    local f = PlayerGui:FindFirstChild(FAB_NAME)
+    if f then f:Destroy() end
+end
+
+-- Cria o botão flutuante (FAB) para reabrir quando minimizado
+local function buildFAB()
+    local fg = PlayerGui:FindFirstChild(FAB_NAME)
+    if fg then fg:Destroy() end
+
+    fabGui = Instance.new("ScreenGui")
+    fabGui.Name           = FAB_NAME
+    fabGui.ResetOnSpawn   = false
+    fabGui.IgnoreGuiInset = true
+    fabGui.DisplayOrder   = 101
+    fabGui.Parent         = PlayerGui
+
+    local fab = Instance.new("TextButton")
+    fab.Size              = UDim2.new(0, FAB_SIZE, 0, FAB_SIZE)
+    fab.Position          = UDim2.new(0, 10, 0.5, -FAB_SIZE/2)
+    fab.BackgroundColor3  = C.FAB
+    fab.Text              = "⬡"
+    fab.TextColor3        = C.WHITE
+    fab.Font              = Enum.Font.GothamBold
+    fab.TextSize          = 20
+    fab.BorderSizePixel   = 0
+    fab.ZIndex            = 10
+    fab.Parent            = fabGui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = fab
+
+    -- Arrastar o FAB
+    local drag, ds, sp = false, nil, nil
+    fab.InputBegan:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=true; ds=inp.Position; sp=fab.Position
+        end
+    end)
+    fab.InputEnded:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if drag and (inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseMovement) then
+            local delta = inp.Position - ds
+            fab.Position = UDim2.new(0, sp.X.Offset+delta.X,
+                                     0, sp.Y.Offset+delta.Y)
+        end
+    end)
+
+    fab.Activated:Connect(function()
+        -- Restaura a janela principal
+        if screenGui and screenGui.Parent then
+            mainFrame.Visible = true
+            minimized = false
+            fabGui:Destroy()
+            fabGui = nil
+        end
+    end)
+end
+
+-- ----------------------------------------------------------------
+-- Constrói a GUI principal
+-- ----------------------------------------------------------------
+local function buildGui()
+    destroyOld()
+    cardFrames = {}
+
+    screenGui = Instance.new("ScreenGui")
+    screenGui.Name           = GUI_NAME
+    screenGui.ResetOnSpawn   = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder   = 100
+    screenGui.Parent         = PlayerGui
+
+    -- Frame principal — largura relativa em mobile, fixa em PC
+    mainFrame = Instance.new("Frame")
+    mainFrame.Name             = "MainFrame"
+    mainFrame.BackgroundColor3 = C.BG
+    mainFrame.BorderSizePixel  = 0
+    mainFrame.Active           = true
+    mainFrame.ClipsDescendants = true
+    mainFrame.ZIndex           = 2
+    mainFrame.Parent           = screenGui
+
+    if isMobile then
+        -- Centrado horizontalmente, parte superior da tela
+        mainFrame.Size     = UDim2.new(0.95, 0, 0, MAX_H)
+        mainFrame.Position = UDim2.new(0.025, 0, 0, 10)
+    else
+        mainFrame.Size     = UDim2.new(0, 460, 0, MAX_H)
+        mainFrame.Position = UDim2.new(0, 20, 0, 20)
+    end
+
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 10)
+    mainCorner.Parent = mainFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color     = C.BORDER
+    stroke.Thickness = 1
+    stroke.Parent    = mainFrame
+
+    -- ── HEADER ────────────────────────────────────────────────
+    local header = Instance.new("Frame")
+    header.Name              = "Header"
+    header.Size              = UDim2.new(1, 0, 0, HDR_H)
+    header.BackgroundColor3  = C.HDR
+    header.BorderSizePixel   = 0
+    header.ZIndex            = 3
+    header.Parent            = mainFrame
+    local hc = Instance.new("UICorner")
+    hc.CornerRadius = UDim.new(0,10)
+    hc.Parent = header
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Text              = "⬡  GARAGE DETECTOR"
+    titleLbl.Size              = UDim2.new(1, -(BTN_W*2+18), 1, 0)
+    titleLbl.Position          = UDim2.new(0, 10, 0, 0)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.TextColor3        = C.TITLE
+    titleLbl.Font              = Enum.Font.GothamBold
+    titleLbl.TextSize          = FONT_TITLE
+    titleLbl.TextXAlignment    = Enum.TextXAlignment.Left
+    titleLbl.ZIndex            = 4
+    titleLbl.Parent            = header
+
+    local function mkBtn(txt, xOff, bg)
+        local b = Instance.new("TextButton")
+        b.Size              = UDim2.new(0, BTN_W, 0, BTN_H)
+        b.Position          = UDim2.new(1, xOff, 0.5, -BTN_H/2)
+        b.BackgroundColor3  = bg
+        b.Text              = txt
+        b.TextColor3        = C.WHITE
+        b.Font              = Enum.Font.GothamBold
+        b.TextSize          = isMobile and 14 or 11
+        b.BorderSizePixel   = 0
+        b.AutoButtonColor   = true
+        b.ZIndex            = 6
+        b.Parent            = header
+        local co = Instance.new("UICorner")
+        co.CornerRadius = UDim.new(0,6)
+        co.Parent = b
+        return b
+    end
+
+    local btnClose = mkBtn("✕", -(BTN_W+6),     C.CLOSE)
+    local btnMini  = mkBtn("─", -(BTN_W*2+10),  C.MINI )
+
+    -- ── STATS ─────────────────────────────────────────────────
+    local statsFrame = Instance.new("Frame")
+    statsFrame.Name              = "Stats"
+    statsFrame.Size              = UDim2.new(1, 0, 0, STATS_H)
+    statsFrame.Position          = UDim2.new(0, 0, 0, HDR_H)
+    statsFrame.BackgroundColor3  = C.HDR
+    statsFrame.BorderSizePixel   = 0
+    statsFrame.ZIndex            = 3
+    statsFrame.Parent            = mainFrame
+
+    local function statLbl(txt, xOff, col)
+        local l = Instance.new("TextLabel")
+        l.Text              = txt
+        l.Size              = UDim2.new(0.25, -4, 1, 0)
+        l.Position          = UDim2.new(xOff, 2, 0, 0)
+        l.BackgroundTransparency = 1
+        l.TextColor3        = col
+        l.Font              = Enum.Font.Gotham
+        l.TextSize          = FONT_STAT
+        l.TextXAlignment    = Enum.TextXAlignment.Center
+        l.ZIndex            = 4
+        l.Parent            = statsFrame
+        return l
+    end
+    lblTotal    = statLbl("Total: 0",    0,    C.CYAN  )
+    lblInGarage = statLbl("In: 0",       0.25, C.GREEN )
+    lblOutside  = statLbl("Out: 0",      0.50, C.RED   )
+    lblUnknown  = statLbl("Unk: 0",      0.75, C.YELLOW)
+
+    -- ── SEPARADOR / COL HEADER (somente PC) ───────────────────
+    local topOffset = HDR_H + STATS_H
+    if not isMobile then
+        local colHeader = Instance.new("Frame")
+        colHeader.Size             = UDim2.new(1, 0, 0, COL_H)
+        colHeader.Position         = UDim2.new(0, 0, 0, topOffset)
+        colHeader.BackgroundColor3 = Color3.fromRGB(28,28,42)
+        colHeader.BorderSizePixel  = 0
+        colHeader.ZIndex           = 3
+        colHeader.Parent           = mainFrame
+
+        local cols = {"Player","Garage","Owner","Dim","Position","Vis","Updated"}
+        local cws  = {0.14,0.11,0.11,0.12,0.26,0.13,0.13}
+        local xA = 0
+        for i, ct in ipairs(cols) do
+            local l = Instance.new("TextLabel")
+            l.Text              = ct
+            l.Size              = UDim2.new(cws[i], -2, 1, 0)
+            l.Position          = UDim2.new(xA, 2, 0, 0)
+            l.BackgroundTransparency = 1
+            l.TextColor3        = C.GRAY
+            l.Font              = Enum.Font.GothamBold
+            l.TextSize          = 10
+            l.TextXAlignment    = Enum.TextXAlignment.Left
+            l.ZIndex            = 4
+            l.Parent            = colHeader
+            xA = xA + cws[i]
+        end
+        topOffset = topOffset + COL_H
+    end
+
+    -- ── SCROLL ────────────────────────────────────────────────
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Name                  = "Scroll"
+    scroll.Size                  = UDim2.new(1, 0, 1, -topOffset)
+    scroll.Position              = UDim2.new(0, 0, 0, topOffset)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel       = 0
+    scroll.ScrollBarThickness    = SCROLL_BAR_W
+    scroll.ScrollBarImageColor3  = C.PURPLE
+    scroll.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+    scroll.CanvasSize            = UDim2.new(0,0,0,0)
+    scroll.ZIndex                = 3
+    scroll.Parent                = mainFrame
+    listFrame = scroll
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.Name
+    layout.Padding   = UDim.new(0, PADDING)
+    layout.Parent    = scroll
+
+    local listPad = Instance.new("UIPadding")
+    listPad.PaddingLeft   = UDim.new(0, PADDING)
+    listPad.PaddingRight  = UDim.new(0, PADDING)
+    listPad.PaddingTop    = UDim.new(0, PADDING)
+    listPad.Parent        = scroll
+
+    -- ── DRAG ──────────────────────────────────────────────────
+    local dragging, dragStart, startPos2 = false, nil, nil
+    header.InputBegan:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseButton1 then
+            dragging  = true
+            dragStart = inp.Position
+            startPos2 = mainFrame.Position
+        end
+    end)
+    header.InputEnded:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.Touch or
+           inp.UserInputType==Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    local dragConn = UserInputService.InputChanged:Connect(function(inp)
+        if dragging and
+           (inp.UserInputType==Enum.UserInputType.Touch or
+            inp.UserInputType==Enum.UserInputType.MouseMovement) then
+            local delta = inp.Position - dragStart
+            mainFrame.Position = UDim2.new(
+                0, startPos2.X.Offset + delta.X,
+                0, startPos2.Y.Offset + delta.Y)
+            clampFrame(mainFrame)
+        end
+    end)
+    table.insert(connections, dragConn)
+
+    -- ── MINIMIZAR ─────────────────────────────────────────────
+    btnMini.Activated:Connect(function()
+        minimized = true
+        mainFrame.Visible = false
+        buildFAB()
+    end)
+
+    -- ── FECHAR ────────────────────────────────────────────────
+    btnClose.Activated:Connect(function()
+        for _, c in ipairs(connections) do
+            pcall(function() c:Disconnect() end)
+        end
+        connections = {}
+        screenGui:Destroy()
+        if fabGui then fabGui:Destroy(); fabGui=nil end
+        playerData = {}
+        cardFrames = {}
+    end)
+end
+
+-- ================================================================
+-- CARTÕES DOS JOGADORES
+-- ================================================================
+
+-- Layout de cartão mobile: empilhado em duas linhas
+-- Layout PC: linha horizontal com colunas
+local PC_COL_W = {0.14,0.11,0.11,0.12,0.26,0.13,0.13}
+
+local function createCard(uid, data)
+    if not listFrame then return end
+
+    local card = Instance.new("Frame")
+    card.Name              = tostring(uid)
+    card.Size              = UDim2.new(1, 0, 0, CARD_H)
+    card.BackgroundColor3  = C.CARD
+    card.BorderSizePixel   = 0
+    card.ZIndex            = 4
+    card.Parent            = listFrame
+    local cc = Instance.new("UICorner")
+    cc.CornerRadius = UDim.new(0,6)
+    cc.Parent = card
+
+    local labels = {}
+
+    if isMobile then
+        -- Linha 1: Nome  |  Status garagem (direita)
+        local l1name = Instance.new("TextLabel")
+        l1name.Name              = "name"
+        l1name.Size              = UDim2.new(0.55, -4, 0, CARD_H/2 - 2)
+        l1name.Position          = UDim2.new(0, 6, 0, 2)
+        l1name.BackgroundTransparency = 1
+        l1name.TextColor3        = C.WHITE
+        l1name.Font              = Enum.Font.GothamBold
+        l1name.TextSize          = FONT_CARD_VAL
+        l1name.TextXAlignment    = Enum.TextXAlignment.Left
+        l1name.TextTruncate      = Enum.TextTruncate.AtEnd
+        l1name.ZIndex            = 5
+        l1name.Parent            = card
+        labels["name"] = l1name
+
+        local l1gs = Instance.new("TextLabel")
+        l1gs.Name              = "garageStatus"
+        l1gs.Size              = UDim2.new(0.45, -4, 0, CARD_H/2 - 2)
+        l1gs.Position          = UDim2.new(0.55, 2, 0, 2)
+        l1gs.BackgroundTransparency = 1
+        l1gs.TextColor3        = C.YELLOW
+        l1gs.Font              = Enum.Font.GothamBold
+        l1gs.TextSize          = FONT_CARD_VAL
+        l1gs.TextXAlignment    = Enum.TextXAlignment.Right
+        l1gs.TextTruncate      = Enum.TextTruncate.AtEnd
+        l1gs.ZIndex            = 5
+        l1gs.Parent            = card
+        labels["garageStatus"] = l1gs
+
+        -- Linha 2: Dim | Pos | Vis | Upd
+        local row2y = CARD_H/2 + 1
+        local row2h = CARD_H/2 - 3
+
+        local function mLabel(name, xScale, wScale, col)
+            local l = Instance.new("TextLabel")
+            l.Name              = name
+            l.Size              = UDim2.new(wScale, -2, 0, row2h)
+            l.Position          = UDim2.new(xScale, 2, 0, row2y)
+            l.BackgroundTransparency = 1
+            l.TextColor3        = col
+            l.Font              = Enum.Font.Gotham
+            l.TextSize          = FONT_CARD
+            l.TextXAlignment    = Enum.TextXAlignment.Left
+            l.TextTruncate      = Enum.TextTruncate.AtEnd
+            l.ZIndex            = 5
+            l.Parent            = card
+            labels[name] = l
+            return l
+        end
+
+        mLabel("dimension",   0,    0.28, C.PURPLE)
+        mLabel("position",    0.28, 0.35, C.CYAN  )
+        mLabel("visibility",  0.63, 0.20, C.GRAY  )
+        mLabel("lastUpdate",  0.83, 0.17, C.GRAY  )
+
+        -- campo owner oculto no mobile (só armazenado no data)
+        labels["garageOwner"] = nil
+
+    else
+        -- Layout PC: linha horizontal
+        local xAcc = 0
+        local pcCols = {
+            {"name",C.WHITE},{"garageStatus",C.YELLOW},{"garageOwner",C.GRAY},
+            {"dimension",C.GRAY},{"position",C.CYAN},{"visibility",C.GRAY},
+            {"lastUpdate",C.GRAY}
+        }
+        for i, pair in ipairs(pcCols) do
+            local cname, ccolor = pair[1], pair[2]
+            local l = Instance.new("TextLabel")
+            l.Name              = cname
+            l.Size              = UDim2.new(PC_COL_W[i], -2, 1, 0)
+            l.Position          = UDim2.new(xAcc, 2, 0, 0)
+            l.BackgroundTransparency = 1
+            l.TextColor3        = ccolor
+            l.Font              = Enum.Font.Gotham
+            l.TextSize          = FONT_CARD
+            l.TextXAlignment    = Enum.TextXAlignment.Left
+            l.TextTruncate      = Enum.TextTruncate.AtEnd
+            l.ZIndex            = 5
+            l.Parent            = card
+            labels[cname] = l
+            xAcc = xAcc + PC_COL_W[i]
+        end
+    end
+
+    cardFrames[uid] = { frame=card, labels=labels }
+    return cardFrames[uid]
+end
+
+local function updateCard(uid, data)
+    local entry = cardFrames[uid]
+    if not entry then
+        entry = createCard(uid, data)
+        if not entry then return end
+    end
+    local lbls = entry.labels
+
+    local posStr = data.position and fmtPos(data.position) or "N/A"
+    local dimShort = data.dimension ~= "UNKNOWN"
+        and data.dimension:sub(1, isMobile and 10 or 12) or "UNKNOWN"
+
+    -- name
+    if lbls["name"] then
+        lbls["name"].Text = isMobile
+            and data.name:sub(1,16)
+            or  data.name
+    end
+
+    -- garage status
+    if lbls["garageStatus"] then
+        local short = isMobile and ({
+            ["IN GARAGE"]="IN GARAGE",["OUTSIDE"]="OUTSIDE",
+            ["UNKNOWN"]="UNKNOWN",["LOADING"]="LOADING"
+        })[data.garageStatus] or data.garageStatus
+        lbls["garageStatus"].Text       = short or data.garageStatus
+        lbls["garageStatus"].TextColor3 = colorGarage(data.garageStatus)
+    end
+
+    -- owner (PC only)
+    if lbls["garageOwner"] then
+        lbls["garageOwner"].Text = data.garageOwner ~= "UNKNOWN"
+            and data.garageOwner:sub(1,10) or "?"
+        lbls["garageOwner"].TextColor3 =
+            data.garageOwner ~= "UNKNOWN" and C.WHITE or C.GRAY
+    end
+
+    -- dimension
+    if lbls["dimension"] then
+        lbls["dimension"].Text       = dimShort
+        lbls["dimension"].TextColor3 = colorDim(data.dimension)
+    end
+
+    -- position
+    if lbls["position"] then lbls["position"].Text = posStr end
+
+    -- visibility
+    if lbls["visibility"] then
+        local visShort = isMobile and data.visibility:sub(1,8) or data.visibility:sub(1,8)
+        lbls["visibility"].Text       = visShort
+        lbls["visibility"].TextColor3 = colorVis(data.visibility)
+    end
+
+    -- last update
+    if lbls["lastUpdate"] then lbls["lastUpdate"].Text = data.lastUpdate end
+end
+
+local function removeCard(uid)
+    if cardFrames[uid] then
+        pcall(function() cardFrames[uid].frame:Destroy() end)
+        cardFrames[uid] = nil
+    end
+end
+
+-- ================================================================
+-- STATS
+-- ================================================================
+local function updateStats()
+    local total, inG, out, unk = 0,0,0,0
+    for _, d in pairs(playerData) do
+        total = total+1
+        local s = d.garageStatus
+        if s=="IN GARAGE" then inG=inG+1
+        elseif s=="OUTSIDE" then out=out+1
+        else unk=unk+1 end
+    end
+    if lblTotal    then lblTotal.Text    = "Total: "..total end
+    if lblInGarage then lblInGarage.Text = "In: "..inG     end
+    if lblOutside  then lblOutside.Text  = "Out: "..out    end
+    if lblUnknown  then lblUnknown.Text  = "Unk: "..unk    end
+end
+
+-- ================================================================
+-- EVENTOS DE JOGADORES
+-- ================================================================
+local function onCharAdded(player, char)
+    local uid = player.UserId
+    if not playerData[uid] then initData(player) end
+    local d = playerData[uid]
+    d.garageStatus = "LOADING"
+    d.dimension    = "UNKNOWN"
+    d.position     = nil
+    d.visibility   = "UNKNOWN"
+end
+
+local function onPlayerAdded(player)
+    initData(player)
+    if player.Character then onCharAdded(player, player.Character) end
+    local c = player.CharacterAdded:Connect(function(char)
+        onCharAdded(player, char)
+    end)
+    table.insert(connections, c)
+end
+
+local function onPlayerRemoving(player)
+    local uid = player.UserId
+    playerData[uid] = nil
+    removeCard(uid)
+    updateStats()
+end
+
+-- ================================================================
+-- LOOP PRINCIPAL
+-- ================================================================
+local function mainLoop()
+    while true do
+        task.wait(UPDATE_INTERVAL)
+        if minimized then continue end
+        if not screenGui or not screenGui.Parent then break end
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            local uid = player.UserId
+            if not playerData[uid] then onPlayerAdded(player) end
+            local ok, err = pcall(updateData, player)
+            if not ok then
+                local d = playerData[uid]
+                if d then
+                    d.garageStatus="UNKNOWN"; d.visibility="UNKNOWN"
+                    d.lastUpdate=timeNow()
+                end
+            end
+            if playerData[uid] then updateCard(uid, playerData[uid]) end
+        end
+
+        -- Remove jogadores que saíram
+        for uid in pairs(playerData) do
+            local found = false
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p.UserId==uid then found=true; break end
+            end
+            if not found then
+                playerData[uid]=nil; removeCard(uid)
+            end
+        end
+
+        updateStats()
+    end
+end
+
+-- ================================================================
+-- INIT
+-- ================================================================
+local function init()
+    buildGui()
+
+    for _, p in ipairs(Players:GetPlayers()) do onPlayerAdded(p) end
+
+    local c1 = Players.PlayerAdded:Connect(onPlayerAdded)
+    local c2 = Players.PlayerRemoving:Connect(onPlayerRemoving)
+    table.insert(connections, c1)
+    table.insert(connections, c2)
+
+    task.spawn(mainLoop)
+    task.spawn(refreshGarageCache)
+    task.spawn(refreshDimCache)
+
+    local plat = isMobile and "MOBILE" or "PC"
+    print("[GarageDetector v2] Iniciado | Plataforma: "..plat)
+end
+
+local ok, err = pcall(init)
+if not ok then
+    warn("[GarageDetector v2] Erro: "..tostring(err))
+end
